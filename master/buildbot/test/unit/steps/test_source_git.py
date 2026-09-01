@@ -25,6 +25,7 @@ from twisted.trial import unittest
 
 from buildbot import config as bbconfig
 from buildbot.interfaces import WorkerSetupError
+from buildbot.process import buildstep
 from buildbot.process import remotetransfer
 from buildbot.process.properties import Interpolate
 from buildbot.process.results import EXCEPTION
@@ -328,6 +329,35 @@ class TestGit(
         )
         self.expect_outcome(result=SUCCESS)
         return self.run_step()
+
+    @parameterized.expand([
+        ('promisor_write', 0),
+        ('filter_write', 1),
+    ])
+    @defer.inlineCallbacks
+    def test_partial_clone_config_write_failure(
+        self, name: str, failing_write: int
+    ) -> InlineCallbacksType[None]:
+        step = self.setup_step(
+            self.stepClass(
+                repourl='http://github.com/buildbot/buildbot.git',
+                filters=['blob:none'],
+            )
+        )
+        object.__setattr__(step, 'supportsFilters', True)
+        writes: list[list[str]] = []
+
+        def fake_dovccmd(command: list[str], **kwargs: Any) -> defer.Deferred[str | int]:
+            if '--get' in command:
+                return defer.succeed('')
+            write_number = len(writes)
+            writes.append(command)
+            return defer.succeed(FAILURE if write_number == failing_write else SUCCESS)
+
+        self.patch(step, '_dovccmd', fake_dovccmd)
+
+        yield self.assertFailure(step._ensurePartialCloneConfig(), buildstep.BuildStepFailed)
+        self.assertEqual(len(writes), failing_write + 1)
 
     @parameterized.expand([
         ('equals_unescaped', 'blob:limit=1m', 'blob:limit=1m'),

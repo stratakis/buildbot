@@ -409,14 +409,19 @@ class Git(Source, GitStepMixin):
         if promisor.strip() == 'true' and actual_filter.strip() == expected_filter:
             return
 
-        yield self._dovccmd(
+        rc = yield self._dovccmd(
             ['config', promisor_key, 'true'],
             abandonOnFailure=False,
         )
-        yield self._dovccmd(
+        if rc != RC_SUCCESS:
+            raise buildstep.BuildStepFailed("Failed to configure Git partial-clone promisor")
+
+        rc = yield self._dovccmd(
             ['config', filter_key, expected_filter],
             abandonOnFailure=False,
         )
+        if rc != RC_SUCCESS:
+            raise buildstep.BuildStepFailed("Failed to configure Git partial-clone filter")
 
     @defer.inlineCallbacks
     def _fetch(
