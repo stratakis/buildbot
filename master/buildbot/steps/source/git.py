@@ -52,6 +52,7 @@ COMBINE_FILTER_RESERVED_CHARS = frozenset('~!@#$^&*()[]{}\\;",<>?\'+%')
 SHARED_CACHE_DIR = '.git-cache'
 SHARED_CACHE_HASH_LENGTH = 16
 SHARED_CACHE_ALTERNATES_MARKER = 'buildbot-shared-cache'
+SHARED_CACHE_OWNER_CONFIG = 'buildbot.sharedCacheOwner'
 SHARED_CACHE_LAST_FSCK_CONFIG = 'buildbot.sharedCacheLastFsck'
 SHARED_CACHE_FSCK_FAILED_CONFIG = 'buildbot.sharedCacheFsckFailed'
 SHARED_CACHE_FSCK_INTERVAL = 24 * 60 * 60
@@ -686,6 +687,30 @@ class Git(Source, GitStepMixin):
         return identity.rstrip('\r\n')
 
     @defer.inlineCallbacks
+    def _getSharedCacheOwner(self, cache_path: str) -> InlineCallbacksType[str]:
+        owner = yield self._dovccache(
+            cache_path,
+            ['config', '--local', '--get', SHARED_CACHE_OWNER_CONFIG],
+            abandonOnFailure=False,
+            collectStdout=True,
+        )
+        return owner.rstrip('\r\n')
+
+    @defer.inlineCallbacks
+    def _markSharedCacheOwned(self, cache_path: str) -> InlineCallbacksType[bool]:
+        rc = yield self._dovccache(
+            cache_path,
+            [
+                'config',
+                '--local',
+                SHARED_CACHE_OWNER_CONFIG,
+                self._getSharedCacheIdentity(),
+            ],
+            abandonOnFailure=False,
+        )
+        return rc == RC_SUCCESS
+
+    @defer.inlineCallbacks
     def _initializeSharedCache(self, cache_path: str) -> InlineCallbacksType[bool]:
         assert self.worker is not None
         parent_path = self.build.path_module.dirname(cache_path)
@@ -735,6 +760,15 @@ class Git(Source, GitStepMixin):
             return False
 
         identity = self._getSharedCacheIdentity()
+        if cache_exists and not managed_cache:
+            owner = yield self._getSharedCacheOwner(cache_path)
+            if owner != identity:
+                self._reportSharedCache(
+                    f"Git shared cache at {cache_path!r} is not marked as a "
+                    "Buildbot-owned cache for this repository"
+                )
+                return False
+
         if cache_exists and managed_cache and not created_cache:
             recorded = yield self._getSharedCacheRecordedIdentity(cache_path)
             if recorded and recorded != identity:
@@ -748,6 +782,11 @@ class Git(Source, GitStepMixin):
             if created_cache:
                 yield self._removeSharedCache(cache_path)
             return False
+
+        if created_cache and not managed_cache:
+            if not (yield self._markSharedCacheOwned(cache_path)):
+                yield self._removeSharedCache(cache_path)
+                return False
 
         remote_url = yield self._dovccache(
             cache_path,

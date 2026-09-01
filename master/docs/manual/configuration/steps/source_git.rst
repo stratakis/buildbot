@@ -124,6 +124,22 @@ The Git step takes the following arguments:
       If an old cache has been deleted or damaged, the checkout may require clobbering before it can continue without it.
       Disabling the option does not remove an entry installed by an earlier build; clobber or recreate the work directory when disabling it.
 
+   Custom cache paths
+      Relative custom paths are resolved from the worker base directory; absolute paths are used directly.
+      On Windows, relative means a path with neither a drive nor a root.
+      Drive-relative paths such as ``C:cache``, current-drive-rooted paths such as ``\cache`` or ``/cache``, and incomplete UNC paths are rejected; use an ordinary relative path, a fully qualified drive path, or a complete UNC path.
+      The path identifies one exact bare repository dedicated to Buildbot; it is not a cache root or a general-purpose reference repository.
+      When Buildbot creates the repository, it records the cache identity in ``buildbot.sharedCacheOwner``.
+      An existing custom repository is accepted only when that ownership marker and its ``origin`` match the computed cache identity.
+      An unmarked or mismatched repository is preserved and rejected without modification.
+      Buildbot owns an accepted custom repository: it may rewrite its ``origin``, hooks directory and maintenance configuration, fetch and prune its branch heads and optional tags, and update ``FETCH_HEAD``.
+      Do not share a custom cache with another consumer.
+      Custom paths are trusted worker configuration.
+      Configure one consistent path spelling for each custom cache; do not configure paths that resolve through symbolic links to the same repository because the per-master lock is keyed by the normalized configured path rather than the worker's resolved file-system identity.
+
+      The cache must be self-contained.
+      Buildbot rejects a cache containing either ``objects/info/alternates`` or ``objects/info/http-alternates`` because checkouts using it would otherwise depend transitively on another object store.
+
    Cache identity and credentials
       The cache identity uses a lowercase scheme and drops a port that is the default for it, so ``git@host:repo``, ``ssh://git@host/repo`` and ``ssh://git@host:22/repo`` share one cache; other spelling differences, such as a non-default port or a trailing slash, select different caches.
       For HTTP and HTTPS URLs, URL userinfo is removed from the cache identity and the cache's ``origin`` URL.
