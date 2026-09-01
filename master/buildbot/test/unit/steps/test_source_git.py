@@ -418,6 +418,43 @@ class TestGit(
         )
         return self.run_step()
 
+    def test_mode_full_clean_failure_clobbers_when_configured(self) -> defer.Deferred[None]:
+        self.setup_step(
+            self.stepClass(
+                repourl='http://github.com/buildbot/buildbot.git',
+                mode='full',
+                method='clean',
+                clobberOnFailure=True,
+            )
+        )
+        self.expect_commands(
+            ExpectShell(workdir='wkdir', command=['git', '--version'])
+            .stdout('git version 1.7.5')
+            .exit(0),
+            ExpectStat(file='wkdir/.buildbot-patched', log_environ=True).exit(1),
+            ExpectListdir(dir='wkdir').files(['.git']).exit(0),
+            ExpectShell(workdir='wkdir', command=['git', 'clean', '-f', '-f', '-d']).exit(1),
+            ExpectRmdir(dir='wkdir', log_environ=True, timeout=1200).exit(0),
+            ExpectShell(
+                workdir='wkdir',
+                command=[
+                    'git',
+                    'clone',
+                    'http://github.com/buildbot/buildbot.git',
+                    '.',
+                    '--progress',
+                ],
+            ).exit(0),
+            ExpectShell(workdir='wkdir', command=['git', 'rev-parse', 'HEAD'])
+            .stdout('f6ad368298bd941e934a41f3babc827b2aa95a1d')
+            .exit(0),
+        )
+        self.expect_outcome(result=SUCCESS)
+        self.expect_property(
+            'got_revision', 'f6ad368298bd941e934a41f3babc827b2aa95a1d', self.sourceName
+        )
+        return self.run_step()
+
     def test_mode_full_clean_progress_False(self) -> defer.Deferred[None]:
         self.setup_step(
             self.stepClass(
@@ -2876,6 +2913,42 @@ class TestGit(
             'got_revision', 'f6ad368298bd941e934a41f3babc827b2aa95a1d', self.sourceName
         )
         return self.run_step()
+
+    @defer.inlineCallbacks
+    def test_fetch_or_fallback_clobbers_after_retry_failure(
+        self,
+    ) -> InlineCallbacksType[None]:
+        step = self.setup_step(
+            self.stepClass(
+                repourl='http://github.com/buildbot/buildbot.git',
+                retryFetch=True,
+                clobberOnFailure=True,
+            )
+        )
+        fetch_calls: list[bool] = []
+        clobber_calls = 0
+
+        def fetch(
+            _: Any,
+            shallowClone: bool | int,
+            abandonOnFailure: bool = True,
+        ) -> defer.Deferred[int]:
+            fetch_calls.append(abandonOnFailure)
+            return defer.succeed(FAILURE)
+
+        def clobber() -> defer.Deferred[None]:
+            nonlocal clobber_calls
+            clobber_calls += 1
+            return defer.succeed(None)
+
+        self.patch(step, '_fetch', fetch)
+        self.patch(step, 'clobber', clobber)
+
+        result = yield step._fetchOrFallback()
+
+        self.assertEqual(fetch_calls, [False, False])
+        self.assertEqual(clobber_calls, 1)
+        self.assertEqual(result, SUCCESS)
 
     def test_mode_incremental_clobberOnFailure(self) -> defer.Deferred[None]:
         self.setup_step(

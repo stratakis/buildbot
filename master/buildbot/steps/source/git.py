@@ -250,8 +250,15 @@ class Git(Source, GitStepMixin):
     @defer.inlineCallbacks
     def clean(self) -> InlineCallbacksType[int]:
         clean_command = ['clean', '-f', '-f', '-d']
-        rc = yield self._dovccmd(clean_command)
+        rc = yield self._dovccmd(
+            clean_command,
+            abandonOnFailure=not self.clobberOnFailure,
+        )
         if rc != RC_SUCCESS:
+            if self.clobberOnFailure:
+                # clobber's full clone initializes submodules itself
+                yield self.clobber()
+                return RC_SUCCESS
             raise buildstep.BuildStepFailed
 
         rc = yield self._fetchOrFallback()
@@ -489,13 +496,18 @@ class Git(Source, GitStepMixin):
         res = yield self._fetch(None, shallowClone=self.shallow, abandonOnFailure=abandonOnFailure)
         if res == RC_SUCCESS:
             return res
-        elif self.retryFetch:
-            yield self._fetch(None, shallowClone=self.shallow)
-        elif self.clobberOnFailure:
+        if self.retryFetch:
+            res = yield self._fetch(
+                None,
+                shallowClone=self.shallow,
+                abandonOnFailure=not self.clobberOnFailure,
+            )
+            if res == RC_SUCCESS:
+                return res
+        if self.clobberOnFailure:
             yield self.clobber()
-        else:
-            raise buildstep.BuildStepFailed()
-        return None
+            return RC_SUCCESS
+        raise buildstep.BuildStepFailed()
 
     @defer.inlineCallbacks
     def _clone(self, shallowClone: bool | int) -> InlineCallbacksType[int | None]:
