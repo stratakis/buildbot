@@ -182,6 +182,8 @@ The Git step takes the following arguments:
 ``filters`` (optional, type: ``list``)
    For each string in the passed in list, adds a ``--filter <filter>`` argument to :command:`git clone` and :command:`git fetch`.
    For existing repositories, Buildbot also configures the remote as a partial clone promisor remote before fetching.
+   If that configuration cannot be persisted, the source step fails before starting the filtered fetch.
+   Git ignores ``--filter`` for a plain local path and clones fully, printing only a warning; use a ``file://`` URL to keep the filter effective.
    This allows for adding filters like ``--filter "tree:0"`` to speed up clone and fetch operations.
    This requires git version 2.27 or higher.
 
