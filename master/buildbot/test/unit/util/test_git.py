@@ -24,6 +24,7 @@ from buildbot.util.git import check_ssh_config
 from buildbot.util.git import ensureSshKeyNewline
 from buildbot.util.git import escapeShellArgIfNeeded
 from buildbot.util.git import getSshKnownHostsContents
+from buildbot.util.git import obfuscate_url_userinfo
 from buildbot.util.git import scp_style_to_url_syntax
 
 
@@ -55,6 +56,49 @@ class TestEscapeShellArgIfNeeded(unittest.TestCase):
         self.assert_does_not_escape('a_b')
         self.assert_does_not_escape('-opt')
         self.assert_does_not_escape('--opt')
+
+
+class TestObfuscateUrlUserinfo(unittest.TestCase):
+    @parameterized.expand([
+        ('no_userinfo', 'https://github.com/buildbot/buildbot.git', None),
+        (
+            'http_password',
+            'https://user:secret@example.com/repo.git?x=1#ref',
+            'https://XXXXXX@example.com/repo.git?x=1#ref',
+        ),
+        (
+            'http_token_only',
+            'https://token@example.com/repo.git',
+            'https://XXXXXX@example.com/repo.git',
+        ),
+        ('ssh_username_only', 'ssh://git@example.com:22/repo.git', None),
+        ('ssh_uppercase_scheme', 'SSH://git@example.com/repo.git', None),
+        (
+            'ssh_password',
+            'ssh://user:secret@example.com/repo.git',
+            'ssh://XXXXXX@example.com/repo.git',
+        ),
+        (
+            'git_username_only',
+            'git://user@example.com/repo.git',
+            'git://XXXXXX@example.com/repo.git',
+        ),
+        (
+            'ssh_encoded_colon',
+            'ssh://user%3Apass@example.com/repo.git',
+            'ssh://XXXXXX@example.com/repo.git',
+        ),
+        ('ssh_invalid_escape', 'ssh://us%zzer@example.com/repo.git', None),
+        ('ssh_bare_percent', 'ssh://100%@example.com/repo.git', None),
+        ('ssh_double_encoded_colon', 'ssh://user%253Apass@example.com/repo.git', None),
+        ('bracket_unterminated', 'https://[', None),
+        ('bracket_not_ipv6', 'https://[server]/path', None),
+        ('scp_style', 'git@example.com:buildbot/buildbot.git', None),
+        ('local_path', '/srv/repos/buildbot.git', None),
+    ])
+    def test_obfuscation(self, name: str, url: str, obfuscated: str | None) -> None:
+        expected = url if obfuscated is None else ('obfuscated', url, obfuscated)
+        self.assertEqual(obfuscate_url_userinfo(url), expected)
 
 
 class TestSetUpGit(config.ConfigErrorsMixin, unittest.TestCase):
