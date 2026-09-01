@@ -275,6 +275,13 @@ class TestCompositeStepMixin(TestBuildStepMixin, TestReactorMixin, unittest.Test
         self.expect_outcome(result=SUCCESS)
         return self.run_step()
 
+    def test_rmfile_old_worker_preserves_worker_path(self) -> defer.Deferred[None]:
+        self.setup_build(worker_version={'*': '99.99', 'rmfile': '3.0'})
+        self.setup_step(CompositeUser(lambda x: x.runRmFile("worker/path")))
+        self.expect_commands(ExpectRmdir(dir='worker/path', log_environ=False).exit(0))
+        self.expect_outcome(result=SUCCESS)
+        return self.run_step()
+
     def test_mkdir(self) -> defer.Deferred[None]:
         self.setup_step(CompositeUser(lambda x: x.runMkdir("d")))
         self.expect_commands(ExpectMkdir(dir='d', log_environ=False).exit(0))
