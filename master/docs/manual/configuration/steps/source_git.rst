@@ -162,6 +162,19 @@ The Git step takes the following arguments:
       Variables exported in the worker daemon's own environment are not removed, so do not set repository-scoped Git variables there.
       Buildbot directs cache hooks to an empty cache-specific directory and does not activate the cache if that directory cannot be recreated.
 
+   Windows
+      Git commands from a shared-cache step use command-scoped ``core.longpaths=true`` unless the step's ``config`` option sets ``core.longpaths`` explicitly.
+      Cache commands run from the local worker base directory and select the cache with ``git -C``, so ``cmd.exe`` is never asked to use a UNC working directory.
+      Commands that operate directly on the cache use a command-scoped ``safe.directory`` entry for that cache path.
+      A fully qualified local or UNC ``repourl`` is trusted separately through command-scoped ``safe.directory`` entries for both the repository path and its ``.git`` subdirectory, so bare and non-bare source repositories work alike.
+      UNC values use Git for Windows' portable ``%(prefix)///server/share/path`` representation.
+      These settings do not modify system or global Git configuration.
+      ``core.longpaths`` applies to Git commands only; worker-side file transfers and other Python or ``cmd.exe`` operations remain subject to the worker's Windows path support.
+      It also does not allow Git to create or enter a repository whose own directory path exceeds the legacy Windows path limit, and the system long-path policy does not lift that either.
+      The default cache path adds 32 characters to the worker base directory, so keep the base directory well within that limit; when the cache path is unusable, Buildbot logs the failure and builds continue without the cache.
+      A UNC cache also remains subject to the reliability and performance characteristics of its network file system and Git for Windows version.
+      Validate a UNC cache against your own Git for Windows release and file server before deploying it.
+
 ``origin`` (optional)
    By default, any clone will use the name "origin" as the remote repository (eg, "origin/master").
    This renderable option allows that to be configured to an alternate name.

@@ -589,6 +589,58 @@ class Git(Source, GitStepMixin):
             d.addTimeout(self.timeout, self.master.reactor)
         return d
 
+    def _dovccmd(
+        self,
+        command: list[str],
+        abandonOnFailure: str | bool = True,
+        collectStdout: bool = False,
+        initialStdin: str | None = None,
+        workdir: str | None = None,
+        config_overrides: dict[str, Any] | None = None,
+        sanitize_repository_environment: bool = False,
+        use_step_config: bool = True,
+        auth_command: str | None = None,
+    ) -> defer.Deferred[str | int | None]:
+        if self.shared_cache and self.worker is not None and self.worker.worker_system == 'nt':
+            config_overrides = dict(config_overrides or {})
+            step_config = self.config if use_step_config else None
+            if not step_config or 'core.longpaths' not in step_config:
+                config_overrides['core.longpaths'] = 'true'
+            source_safe_directory = self._getWindowsSourceSafeDirectory()
+            if source_safe_directory is not None:
+                config_overrides.setdefault('safe.directory', source_safe_directory)
+
+        return super()._dovccmd(
+            command,
+            abandonOnFailure=abandonOnFailure,
+            collectStdout=collectStdout,
+            initialStdin=initialStdin,
+            workdir=workdir,
+            config_overrides=config_overrides,
+            sanitize_repository_environment=sanitize_repository_environment,
+            use_step_config=use_step_config,
+            auth_command=auth_command,
+        )
+
+    def _getWindowsSafeDirectory(self, path: str) -> str:
+        normalized_path = path.replace('\\', '/')
+        if normalized_path.startswith('//') and not normalized_path.startswith('//?/'):
+            return f'%(prefix)/{normalized_path}'
+        return path
+
+    def _getWindowsSourceSafeDirectory(self) -> list[str] | None:
+        if (
+            self.worker is None
+            or self.worker.worker_system != 'nt'
+            or not self.build.path_cls(self.repourl).is_absolute()
+        ):
+            return None
+        # Git checks the git directory, which is <path>/.git when non-bare
+        return [
+            self._getWindowsSafeDirectory(self.repourl),
+            self._getWindowsSafeDirectory(self.build.path_module.join(self.repourl, '.git')),
+        ]
+
     def _getSharedCacheGitConfig(self, cache_path: str) -> dict[str, str]:
         assert self.build is not None
         config = {
@@ -598,6 +650,9 @@ class Git(Source, GitStepMixin):
             'maintenance.auto': 'false',
             'protocol.ext.allow': 'never',
         }
+        if self.worker is not None and self.worker.worker_system == 'nt':
+            config['core.longpaths'] = 'true'
+            config['safe.directory'] = self._getWindowsSafeDirectory(cache_path)
         return config
 
     def _dovccache(
@@ -614,7 +669,22 @@ class Git(Source, GitStepMixin):
         cache_command = command
         workdir = cache_path
         auth_kwargs: dict[str, str] = {}
-        if not use_cache_repository:
+        if self.worker.worker_system == 'nt':
+            workdir = self.worker.worker_basedir
+            if use_cache_repository:
+                subcommand = next((arg for arg in command if not arg.startswith('-')), None)
+                if subcommand is not None:
+                    auth_kwargs['auth_command'] = subcommand
+                cache_command = ['-C', cache_path, *command]
+                source_safe_directory = self._getWindowsSourceSafeDirectory()
+                cache_safe_directory = self._getWindowsSafeDirectory(cache_path)
+                if source_safe_directory is not None:
+                    trust_arguments: list[str] = []
+                    for entry in source_safe_directory:
+                        if entry != cache_safe_directory:
+                            trust_arguments += ['-c', f'safe.directory={entry}']
+                    cache_command = [*trust_arguments, *cache_command]
+        elif not use_cache_repository:
             workdir = self.worker.worker_basedir
 
         return self._dovccmd(

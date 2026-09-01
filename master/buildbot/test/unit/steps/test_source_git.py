@@ -5465,6 +5465,33 @@ class TestGitSharedCache(
         if not active:
             self.assertIn('deletes leftover directories', headers[0])
 
+    @parameterized.expand([
+        ('default_cache_in_basedir', True, False),
+        ('custom_on_another_drive', r'D:\git\repo.git', True),
+        ('unc_cache_outside_basedir', r'\\server\share\repo.git', True),
+    ])
+    @defer.inlineCallbacks
+    def test_shared_cache_basedir_deletion_guard_on_windows(
+        self, name: str, shared_cache: bool | str, active: bool
+    ) -> InlineCallbacksType[None]:
+        step = self.setup_step(
+            self.stepClass(
+                repourl='https://github.com/buildbot/buildbot.git',
+                shared_cache=shared_cache,
+            )
+        )
+        self.change_worker_system('nt')
+        self.worker.worker_basedir = r'C:\wrk'
+        object.__setattr__(step, 'supportsSharedCache', True)
+        object.__setattr__(step.worker, 'worker_deletes_leftover_dirs', True)
+        self.patch(step, '_prepareSharedCacheRepository', lambda *a: defer.succeed(True))
+        self.patch(step, '_updateSharedCache', lambda *a: defer.succeed(True))
+        self.patch(step, '_isSharedCacheHealthy', lambda *a: defer.succeed(True))
+
+        yield step._ensureSharedCache()
+
+        self.assertEqual(step._shared_cache_active, active)
+
     @defer.inlineCallbacks
     def test_shared_cache_is_prepared_before_the_checkout(self) -> InlineCallbacksType[None]:
         step = self.setup_step(
@@ -6800,6 +6827,27 @@ class TestGitSharedCache(
         self.assertEqual(result, adopted)
         self.assertEqual(removed, [])
 
+    def test_shared_cache_windows_auth_command_skips_leading_flags(self) -> None:
+        step = self.setup_step(
+            self.stepClass(
+                repourl='https://github.com/buildbot/buildbot.git',
+                shared_cache=True,
+            )
+        )
+        self.change_worker_system('nt')
+        self.worker.worker_basedir = r'C:\wrk'
+        calls: list[dict[str, Any]] = []
+
+        def fake_dovccmd(command: list[str], **kwargs: Any) -> defer.Deferred[int]:
+            calls.append(kwargs)
+            return defer.succeed(0)
+
+        self.patch(step, '_dovccmd', fake_dovccmd)
+
+        step._dovccache('/cache/repo.git', ['--git-dir=/cache/repo.git', 'rev-parse'])
+
+        self.assertEqual(calls[0]['auth_command'], 'rev-parse')
+
     @parameterized.expand([
         ('bare', 'true\n', True),
         ('non_bare', 'false\n', False),
@@ -6902,6 +6950,252 @@ class TestGitSharedCache(
         self.assertNotIn('credential.helper', overrides)
         self.assertEqual(overrides['core.hooksPath'], '/cache/repo.git/buildbot-hooks')
         self.assertNotIn('safe.directory', overrides)
+
+    def test_shared_cache_windows_cache_commands_avoid_unc_workdir(self) -> None:
+        step = self.setup_step(
+            self.stepClass(
+                repourl='https://github.com/buildbot/buildbot.git',
+                shared_cache=True,
+            )
+        )
+        self.change_worker_system('nt')
+        calls: list[tuple[list[str], dict[str, Any]]] = []
+
+        def fake_dovccmd(command: list[str], **kwargs: Any) -> defer.Deferred[int]:
+            calls.append((command, kwargs))
+            return defer.succeed(0)
+
+        self.patch(step, '_dovccmd', fake_dovccmd)
+
+        cache_path = r'\\server\share\repo.git'
+        self.worker.worker_basedir = r'C:\wrk'
+        step._dovccache(cache_path, ['status'])
+
+        command, kwargs = calls[0]
+        self.assertEqual(command, ['-C', cache_path, 'status'])
+        self.assertEqual(kwargs['workdir'], r'C:\wrk')
+        self.assertEqual(kwargs['auth_command'], 'status')
+        self.assertEqual(kwargs['config_overrides']['core.longpaths'], 'true')
+        self.assertEqual(
+            kwargs['config_overrides']['safe.directory'],
+            '%(prefix)///server/share/repo.git',
+        )
+
+    def test_shared_cache_windows_cache_fetch_trusts_unc_source(self) -> None:
+        source_path = r'\\source\repositories\project.git'
+        cache_path = r'\\cache\buildbot\project.git'
+        step = self.setup_step(
+            self.stepClass(
+                repourl=source_path,
+                shared_cache=cache_path,
+            )
+        )
+        self.change_worker_system('nt')
+        self.worker.worker_basedir = r'C:\wrk'
+        calls: list[tuple[list[str], dict[str, Any]]] = []
+
+        def fake_dovccmd(command: list[str], **kwargs: Any) -> defer.Deferred[int]:
+            calls.append((command, kwargs))
+            return defer.succeed(0)
+
+        self.patch(step, '_dovccmd', fake_dovccmd)
+
+        step._dovccache(cache_path, ['fetch', source_path, 'main'])
+
+        command, kwargs = calls[0]
+        self.assertEqual(
+            command,
+            [
+                '-c',
+                'safe.directory=%(prefix)///source/repositories/project.git',
+                '-c',
+                'safe.directory=%(prefix)///source/repositories/project.git/.git',
+                '-C',
+                cache_path,
+                'fetch',
+                source_path,
+                'main',
+            ],
+        )
+        self.assertEqual(kwargs['auth_command'], 'fetch')
+        self.assertEqual(
+            kwargs['config_overrides']['safe.directory'],
+            '%(prefix)///cache/buildbot/project.git',
+        )
+
+    @defer.inlineCallbacks
+    def test_git_command_auth_override_handles_cache_prefix(
+        self,
+    ) -> InlineCallbacksType[None]:
+        step = self.setup_step(
+            self.stepClass(
+                repourl='https://github.com/buildbot/buildbot.git',
+                shared_cache=True,
+            )
+        )
+        checked_commands: list[str] = []
+
+        def is_auth_needed(command: str) -> bool:
+            checked_commands.append(command)
+            return False
+
+        def run_command(command: Any) -> defer.Deferred[None]:
+            command.rc = 0
+            return defer.succeed(None)
+
+        self.patch(step._git_auth, 'is_auth_needed_for_git_command', is_auth_needed)
+        self.patch(step, 'runCommand', run_command)
+        step.stdio_log = yield step.addLogForRemoteCommands('stdio')
+
+        yield git.GitStepMixin._dovccmd(
+            step,
+            ['-C', '/cache/repo.git', 'fetch'],
+            workdir='/wrk',
+            auth_command='fetch',
+        )
+
+        self.assertEqual(checked_commands, ['fetch'])
+
+    @defer.inlineCallbacks
+    def test_shared_cache_windows_git_commands_enable_long_paths(
+        self,
+    ) -> InlineCallbacksType[None]:
+        step = self.setup_step(
+            self.stepClass(
+                repourl='https://github.com/buildbot/buildbot.git',
+                shared_cache=True,
+            )
+        )
+        self.change_worker_system('nt')
+        calls: list[dict[str, Any]] = []
+
+        def fake_dovccmd(
+            step: git.GitStepMixin,
+            command: list[str],
+            **kwargs: Any,
+        ) -> defer.Deferred[int]:
+            calls.append(kwargs)
+            return defer.succeed(0)
+
+        self.patch(git.GitStepMixin, '_dovccmd', fake_dovccmd)
+
+        yield step._dovccmd(
+            ['status'],
+            config_overrides={'core.longpaths': 'false', 'test.option': 'value'},
+        )
+
+        self.assertEqual(
+            calls[0]['config_overrides'],
+            {'core.longpaths': 'true', 'test.option': 'value'},
+        )
+
+    @defer.inlineCallbacks
+    def test_shared_cache_windows_git_commands_trust_unc_source(
+        self,
+    ) -> InlineCallbacksType[None]:
+        source_path = r'\\server\share\repository.git'
+        step = self.setup_step(
+            self.stepClass(
+                repourl=source_path,
+                shared_cache=True,
+            )
+        )
+        self.change_worker_system('nt')
+        calls: list[dict[str, Any]] = []
+
+        def fake_dovccmd(
+            step: git.GitStepMixin,
+            command: list[str],
+            **kwargs: Any,
+        ) -> defer.Deferred[int]:
+            calls.append(kwargs)
+            return defer.succeed(0)
+
+        self.patch(git.GitStepMixin, '_dovccmd', fake_dovccmd)
+
+        yield step._dovccmd(['clone', source_path, '.'])
+
+        self.assertEqual(
+            calls[0]['config_overrides']['safe.directory'],
+            [
+                '%(prefix)///server/share/repository.git',
+                '%(prefix)///server/share/repository.git/.git',
+            ],
+        )
+
+    def test_windows_source_trust_covers_the_git_directory(self) -> None:
+        step = self.setup_step(
+            self.stepClass(
+                repourl=r'\\server\share\repository',
+                shared_cache=True,
+            )
+        )
+        self.change_worker_system('nt')
+
+        self.assertEqual(
+            step._getWindowsSourceSafeDirectory(),
+            [
+                '%(prefix)///server/share/repository',
+                '%(prefix)///server/share/repository/.git',
+            ],
+        )
+
+    @defer.inlineCallbacks
+    def test_config_override_emits_one_argument_per_value(self) -> InlineCallbacksType[None]:
+        step = self.setup_step(
+            self.stepClass(
+                repourl='https://github.com/buildbot/buildbot.git',
+                shared_cache=True,
+            )
+        )
+        commands: list[list[str]] = []
+
+        def run_command(command: Any) -> defer.Deferred[None]:
+            commands.append(command.command)
+            command.rc = 0
+            return defer.succeed(None)
+
+        self.patch(step, 'runCommand', run_command)
+        step.stdio_log = yield step.addLogForRemoteCommands('stdio')
+
+        yield git.GitStepMixin._dovccmd(
+            step,
+            ['status'],
+            config_overrides={'safe.directory': ['/first', '/second']},
+        )
+
+        self.assertEqual(
+            commands[0][:5],
+            ['git', '-c', 'safe.directory=/first', '-c', 'safe.directory=/second'],
+        )
+
+    @defer.inlineCallbacks
+    def test_shared_cache_windows_keeps_explicit_long_paths_config(
+        self,
+    ) -> InlineCallbacksType[None]:
+        step = self.setup_step(
+            self.stepClass(
+                repourl='https://github.com/buildbot/buildbot.git',
+                shared_cache=True,
+                config={'core.longpaths': 'false'},
+            )
+        )
+        self.change_worker_system('nt')
+        calls: list[dict[str, Any]] = []
+
+        def fake_dovccmd(
+            step: git.GitStepMixin,
+            command: list[str],
+            **kwargs: Any,
+        ) -> defer.Deferred[int]:
+            calls.append(kwargs)
+            return defer.succeed(0)
+
+        self.patch(git.GitStepMixin, '_dovccmd', fake_dovccmd)
+
+        yield step._dovccmd(['status'])
+
+        self.assertNotIn('core.longpaths', calls[0]['config_overrides'])
 
     @defer.inlineCallbacks
     def test_initialize_shared_cache_uses_bare_init_and_cleans_failure(
