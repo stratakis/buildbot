@@ -55,6 +55,7 @@ if TYPE_CHECKING:
 RC_SUCCESS = 0
 OBFUSCATED_VALUE = 'XXXXXX'
 USERNAME_ONLY_URL_SCHEMES = frozenset({'ssh'})
+SHARED_CACHE_MINIMUM_GIT_VERSION = '2.12.0'
 GIT_REPOSITORY_ENVIRONMENT_VARIABLES = frozenset({
     'GIT_ALTERNATE_OBJECT_DIRECTORIES',
     'GIT_COMMON_DIR',
@@ -158,6 +159,7 @@ class GitMixin:
         self.supportsSubmoduleCheckout = False
         self.supportsSshPrivateKeyAsEnvOption = False
         self.supportsSshPrivateKeyAsConfigOption = False
+        self.supportsSharedCache = False
         self.supportsFilters = False
         self.supports_lsremote_symref = False
         self.supports_credential_store = False
@@ -180,6 +182,8 @@ class GitMixin:
             self.supportsSubmoduleCheckout = True
         if version >= parse_version("1.7.9"):
             self.supports_credential_store = True
+        if version >= parse_version(SHARED_CACHE_MINIMUM_GIT_VERSION):
+            self.supportsSharedCache = True
         if version >= parse_version("2.3.0"):
             self.supportsSshPrivateKeyAsEnvOption = True
         if version >= parse_version("2.8.0"):

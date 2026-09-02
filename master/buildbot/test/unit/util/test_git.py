@@ -166,6 +166,7 @@ class TestParseGitFeatures(GitMixin, unittest.TestCase):
         self.assertFalse(self.supportsSubmoduleCheckout)
         self.assertFalse(self.supportsSshPrivateKeyAsEnvOption)
         self.assertFalse(self.supportsSshPrivateKeyAsConfigOption)
+        self.assertFalse(self.supportsSharedCache)
         self.assertFalse(self.supports_lsremote_symref)
         self.assertFalse(self.supports_credential_store)
 
@@ -177,6 +178,7 @@ class TestParseGitFeatures(GitMixin, unittest.TestCase):
         self.assertFalse(self.supportsSubmoduleCheckout)
         self.assertFalse(self.supportsSshPrivateKeyAsEnvOption)
         self.assertFalse(self.supportsSshPrivateKeyAsConfigOption)
+        self.assertFalse(self.supportsSharedCache)
         self.assertFalse(self.supports_lsremote_symref)
         self.assertFalse(self.supports_credential_store)
 
@@ -188,8 +190,17 @@ class TestParseGitFeatures(GitMixin, unittest.TestCase):
         self.assertFalse(self.supportsSubmoduleCheckout)
         self.assertFalse(self.supportsSshPrivateKeyAsEnvOption)
         self.assertFalse(self.supportsSshPrivateKeyAsConfigOption)
+        self.assertFalse(self.supportsSharedCache)
         self.assertFalse(self.supports_lsremote_symref)
         self.assertFalse(self.supports_credential_store)
+
+    @parameterized.expand([
+        ('before_minimum', '2.11.12', False),
+        ('minimum', '2.12.0', True),
+    ])
+    def test_git_shared_cache(self, name: str, version: str, supported: bool) -> None:
+        self.parseGitFeatures(f'git version {version}')
+        self.assertEqual(self.supportsSharedCache, supported)
 
     def test_git_2_10_0(self) -> None:
         self.parseGitFeatures('git version 2.10.0')
@@ -199,6 +210,7 @@ class TestParseGitFeatures(GitMixin, unittest.TestCase):
         self.assertTrue(self.supportsSubmoduleCheckout)
         self.assertTrue(self.supportsSshPrivateKeyAsEnvOption)
         self.assertTrue(self.supportsSshPrivateKeyAsConfigOption)
+        self.assertFalse(self.supportsSharedCache)
         self.assertTrue(self.supports_lsremote_symref)
         self.assertTrue(self.supports_credential_store)
 

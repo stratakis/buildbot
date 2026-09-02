@@ -48,6 +48,46 @@ The Git step takes the following arguments:
 ``reference`` (optional)
    Use the specified string as a path to a reference repository on the local machine.
    Git will try to grab objects from this path first instead of the main repository, if they exist.
+   This option is mutually exclusive with ``shared_cache``, which maintains such a repository for you.
+
+``shared_cache`` (optional, default: ``False``)
+   When set to ``True``, Buildbot maintains one bare Git object cache per repository on each worker and lets every builder on that worker read objects from it through Git's alternates mechanism.
+   Builders that share a worker then stop keeping private copies of the same history, which saves disk space and makes new checkouts faster because most objects are already present locally.
+   The cache lives at ``<worker-basedir>/.git-cache/<hash>.git``, where the hash is the first 16 hex digits of the SHA-256 of the cache identity.
+
+   .. code-block:: python
+
+      from buildbot.plugins import steps
+
+      factory.addStep(steps.Git(repourl='https://example.org/repo.git',
+                                mode='full', method='fresh',
+                                shared_cache=True))
+
+   Enabling the option makes the first build on a worker slower, because Buildbot populates the cache with the repository's full history before the checkout runs.
+   The worker needs room for that cache in addition to its existing work directories, which keep the objects they already have.
+   A string value specifies a custom cache path instead of the default one.
+
+   This option requires Git 2.12.0 or later.
+   On older versions Buildbot does not create, update, or activate a shared cache, and new checkouts use the normal cache-free path.
+   If an existing checkout already has a Buildbot-managed alternate from an earlier build, Buildbot preserves it to avoid removing access to borrowed objects, so keep that cache available until the checkout is clobbered or recreated.
+   It needs no particular worker version, except that detecting a worker started with ``--delete-leftover-dirs`` requires worker 3.6.0 or later.
+   ``shared_cache`` and ``reference`` are mutually exclusive.
+   The cache applies only to the top-level repository: submodule object databases and Git LFS payloads are not shared.
+
+   Cache identity and credentials
+      The cache identity uses a lowercase scheme and drops a port that is the default for it, so ``git@host:repo``, ``ssh://git@host/repo`` and ``ssh://git@host:22/repo`` share one cache; other spelling differences, such as a non-default port or a trailing slash, select different caches.
+      For HTTP and HTTPS URLs, URL userinfo is removed from the cache identity and the cache's ``origin`` URL.
+      For other schemes the username is kept, so ``ssh://alice@host/repo`` and ``ssh://bob@host/repo`` use separate caches.
+      Credentials supplied through ``auth_credentials`` or ``git_credentials`` are also not part of the cache identity.
+      Consequently, ``shared_cache=True`` makes all credentials used with the same credential-free repository URL share one object store.
+      Enabling this mode asserts that those credentials expose the same repository object graph and are permitted to share objects.
+      If authentication can expose different objects for the same URL, configure a distinct string ``shared_cache`` path for each credential scope.
+      The configured ``repourl`` and credentials are still used for network fetches.
+      HTTP and HTTPS repository URLs containing a query or fragment are rejected when shared caching is enabled because Buildbot cannot safely distinguish repository identity parameters from credentials that must not be persisted.
+      This restriction does not apply when ``shared_cache`` is disabled.
+      Relative local file-system paths are not supported as ``repourl`` when ``shared_cache`` is enabled; use an absolute local path or a repository URL.
+      On Windows, a local ``repourl`` must likewise be fully qualified; drive-relative, current-drive-rooted, and incomplete UNC paths are rejected.
+      This does not affect relative string values for ``shared_cache`` itself, which are resolved from the worker base directory as described above.
 
 ``origin`` (optional)
    By default, any clone will use the name "origin" as the remote repository (eg, "origin/master").

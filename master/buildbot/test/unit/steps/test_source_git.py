@@ -5396,3 +5396,363 @@ class TestGitCommit(
         self.expect_outcome(result=EXCEPTION)
         self.run_step()
         self.flushLoggedErrors(WorkerSetupError)
+
+
+class TestGitSharedCache(
+    sourcesteps.SourceStepMixin, config.ConfigErrorsMixin, TestReactorMixin, unittest.TestCase
+):
+    stepClass = git.Git
+
+    def setUp(self) -> defer.Deferred[None]:  # type: ignore[override]
+        self.setup_test_reactor()
+        self.sourceName = self.stepClass.__name__
+        return self.setup_test_build_step()
+
+    def test_old_git_ignores_shared_cache_end_to_end(self) -> defer.Deferred[None]:
+        self.setup_step(
+            self.stepClass(
+                repourl='http://github.com/buildbot/buildbot.git',
+                mode='full',
+                method='clobber',
+                shared_cache=True,
+            )
+        )
+        self.expect_commands(
+            ExpectShell(workdir='wkdir', command=['git', '--version'])
+            .stdout('git version 2.11.0')
+            .exit(0),
+            ExpectStat(file='wkdir/.buildbot-patched', log_environ=True).exit(1),
+            ExpectRmdir(dir='wkdir', log_environ=True, timeout=1200).exit(0),
+            ExpectShell(
+                workdir='wkdir',
+                command=[
+                    'git',
+                    'clone',
+                    'http://github.com/buildbot/buildbot.git',
+                    '.',
+                    '--progress',
+                ],
+            ).exit(0),
+            ExpectShell(workdir='wkdir', command=['git', 'rev-parse', 'HEAD'])
+            .stdout('f6ad368298bd941e934a41f3babc827b2aa95a1d')
+            .exit(0),
+        )
+        self.expect_outcome(result=SUCCESS)
+        return self.run_step()
+
+    def test_shared_cache_preserves_positional_submodules_argument(self) -> None:
+        step = self.stepClass(
+            'http://github.com/buildbot/buildbot.git',
+            22,
+            'HEAD',
+            'incremental',
+            None,
+            None,
+            True,
+        )
+
+        self.assertTrue(step.submodules)
+        self.assertFalse(step.shared_cache)
+
+    @parameterized.expand([
+        (
+            'default',
+            True,
+            '/wrk/.git-cache/51509057e6aa2288.git',
+        ),
+        ('relative_custom', 'shared/repo.git', '/wrk/shared/repo.git'),
+        ('absolute_custom', '/srv/git/repo.git', '/srv/git/repo.git'),
+    ])
+    def test_shared_cache_path(
+        self, name: str, shared_cache: bool | str, expected_path: str
+    ) -> None:
+        step = self.setup_step(
+            self.stepClass(
+                repourl='http://github.com/buildbot/buildbot.git',
+                shared_cache=shared_cache,
+            )
+        )
+
+        self.assertEqual(step._computeCachePath(), expected_path)
+
+    def test_shared_cache_path_uses_windows_worker_root(self) -> None:
+        step = self.setup_step(
+            self.stepClass(
+                repourl='http://github.com/buildbot/buildbot.git',
+                shared_cache='shared/repo.git',
+            )
+        )
+        self.change_worker_system('nt')
+        self.worker.worker_basedir = r'C:\wrk'
+
+        self.assertEqual(step._computeCachePath(), r'C:\wrk\shared\repo.git')
+
+    def test_shared_cache_rejects_incomplete_windows_worker_root(self) -> None:
+        step = self.setup_step(
+            self.stepClass(
+                repourl='http://github.com/buildbot/buildbot.git',
+                shared_cache=True,
+            )
+        )
+        self.change_worker_system('nt')
+        self.worker.worker_basedir = r'\\server'
+
+        with self.assertRaisesRegex(ValueError, 'requires an absolute worker basedir'):
+            step._computeCachePath()
+
+    @parameterized.expand([
+        ('drive_relative', r'C:cache'),
+        ('root_relative_backslash', r'\cache'),
+        ('root_relative_slash', '/cache'),
+        ('incomplete_unc', r'\\server'),
+    ])
+    def test_windows_shared_cache_path_rejects_partially_qualified_path(
+        self, name: str, cache_path: str
+    ) -> None:
+        step = self.setup_step(
+            self.stepClass(
+                repourl='https://github.com/buildbot/buildbot.git',
+                shared_cache=cache_path,
+            )
+        )
+        self.change_worker_system('nt')
+        self.worker.worker_basedir = r'C:\wrk'
+
+        with self.assertRaisesRegex(
+            buildstep.BuildStepFailed,
+            'Windows shared_cache paths must be fully qualified or relative',
+        ):
+            step._validateRenderedSharedCache()
+
+        with self.assertRaisesRegex(
+            ValueError,
+            'Windows shared_cache paths must be fully qualified or relative',
+        ):
+            step._computeCachePath()
+
+    @parameterized.expand([
+        (
+            'http_ipv6_with_port',
+            'https://user:secret@[2001:db8::1]:8443/repo.git',
+            'https://[2001:db8::1]:8443/repo.git',
+        ),
+        (
+            'ssh_username_preserved',
+            'ssh://git@example.com:2222/buildbot/buildbot.git',
+            'ssh://git@example.com:2222/buildbot/buildbot.git',
+        ),
+        (
+            'scheme_normalized',
+            'HTTPS://Example.COM/repo.git',
+            'https://example.com/repo.git',
+        ),
+        (
+            'scp_style_without_scheme',
+            'git@example.com:buildbot/buildbot.git',
+            'git@example.com:buildbot/buildbot.git',
+        ),
+        (
+            'malformed_port_keeps_host_text',
+            'ssh://git@host:notaport/repo.git',
+            'ssh://git@host:notaport/repo.git',
+        ),
+        (
+            'malformed_port_still_drops_userinfo',
+            'https://user:secret@example.com:notaport/repo.git',
+            'https://example.com:notaport/repo.git',
+        ),
+        (
+            'default_ssh_port_dropped',
+            'ssh://git@example.com:22/buildbot/buildbot.git',
+            'ssh://git@example.com/buildbot/buildbot.git',
+        ),
+        (
+            'default_https_port_dropped',
+            'https://example.com:443/repo.git',
+            'https://example.com/repo.git',
+        ),
+        (
+            'non_default_port_kept',
+            'https://example.com:8443/repo.git',
+            'https://example.com:8443/repo.git',
+        ),
+        (
+            'malformed_bracket_host',
+            'https://[server]/repo.git',
+            'https://[server]/repo.git',
+        ),
+        (
+            'ipv6_literal_host',
+            'https://[::1]:8443/repo.git',
+            'https://[::1]:8443/repo.git',
+        ),
+    ])
+    def test_shared_cache_identity_edge_cases(
+        self, name: str, repourl: str, expected_identity: str
+    ) -> None:
+        step = self.stepClass(repourl=repourl, shared_cache=True)
+
+        self.assertEqual(step._getSharedCacheIdentity(), expected_identity)
+
+    def test_shared_cache_identity_ignores_http_credential_scope(self) -> None:
+        identities = {
+            self.stepClass(repourl=repourl, shared_cache=True)._getSharedCacheIdentity()
+            for repourl in (
+                'https://alice:secret-a@example.com/repo.git',
+                'https://bob:secret-b@example.com/repo.git',
+            )
+        }
+
+        self.assertEqual(identities, {'https://example.com/repo.git'})
+
+    def test_shared_cache_requires_valid_type(self) -> None:
+        self.assertRaisesConfigError(
+            'Git: shared_cache must be a boolean, string, or renderable',
+            lambda: self.stepClass(
+                repourl='http://github.com/buildbot/buildbot.git',
+                shared_cache=object(),  # type: ignore[arg-type]
+            ),
+        )
+
+    @parameterized.expand([
+        ('invalid_type', 1, None, 'rendered shared_cache must be a boolean or string'),
+        (
+            'invalid_path',
+            'cache\npath',
+            None,
+            'rendered shared_cache path must not contain NUL or newline characters',
+        ),
+        ('reference_conflict', True, 'some/ref', 'shared_cache and reference cannot both be set'),
+    ])
+    def test_validate_rendered_shared_cache(
+        self,
+        name: str,
+        shared_cache: Any,
+        reference: str | None,
+        expected_error: str,
+    ) -> None:
+        step = self.stepClass(
+            repourl='https://github.com/buildbot/buildbot.git',
+            shared_cache=True,
+        )
+        object.__setattr__(step, 'shared_cache', shared_cache)
+        object.__setattr__(step, 'reference', reference)
+
+        with self.assertRaisesRegex(buildstep.BuildStepFailed, expected_error):
+            step._validateRenderedSharedCache()
+
+    @parameterized.expand([
+        ('query', 'https://example.com/repo.git?token=secret'),
+        ('fragment', 'https://example.com/repo.git#credential'),
+    ])
+    def test_validate_shared_cache_rejects_http_url_suffix(self, name: str, repourl: str) -> None:
+        step = self.setup_step(self.stepClass(repourl=repourl, shared_cache=True))
+
+        with self.assertRaisesRegex(
+            buildstep.BuildStepFailed,
+            r'shared_cache does not support HTTP\(S\) repository URLs with a query or fragment',
+        ):
+            step._validateRenderedSharedCache()
+
+    def test_validate_shared_cache_allows_malformed_bracket_repourl(self) -> None:
+        step = self.setup_step(
+            self.stepClass(repourl='https://[server]/repo.git', shared_cache=True)
+        )
+
+        step._validateRenderedSharedCache()
+
+        self.assertEqual(step._getSharedCacheIdentity(), 'https://[server]/repo.git')
+
+    def test_validate_http_url_suffix_without_shared_cache(self) -> None:
+        step = self.setup_step(
+            self.stepClass(
+                repourl='https://example.com/repo.git?token=secret',
+                shared_cache=False,
+            )
+        )
+
+        step._validateRenderedSharedCache()
+
+    @parameterized.expand([
+        ('posix_relative', 'posix', '../repository.git', True),
+        ('posix_relative_with_colon', 'posix', './repository:name.git', True),
+        ('posix_absolute', 'posix', '/srv/git/repository.git', False),
+        ('scp_remote', 'posix', 'git@example.com:repository.git', False),
+        ('windows_relative', 'nt', r'..\repository.git', True),
+        ('windows_drive_relative', 'nt', r'C:repository.git', True),
+        ('windows_root_relative_backslash', 'nt', r'\repository.git', True),
+        ('windows_root_relative_slash', 'nt', '/repository.git', True),
+        ('windows_incomplete_unc', 'nt', r'\\server', True),
+        ('windows_absolute', 'nt', r'C:\repository.git', False),
+        ('windows_unc', 'nt', r'\\server\share\repository.git', False),
+    ])
+    def test_validate_shared_cache_repository_location(
+        self,
+        name: str,
+        worker_system: str,
+        repourl: str,
+        invalid: bool,
+    ) -> None:
+        step = self.setup_step(self.stepClass(repourl=repourl, shared_cache=True))
+        self.change_worker_system(worker_system)
+
+        if invalid:
+            with self.assertRaisesRegex(
+                buildstep.BuildStepFailed,
+                'shared_cache does not support relative local repository paths',
+            ):
+                step._validateRenderedSharedCache()
+        else:
+            step._validateRenderedSharedCache()
+
+    @defer.inlineCallbacks
+    def test_run_vc_rejects_relative_repository_before_scp_conversion(
+        self,
+    ) -> InlineCallbacksType[None]:
+        step = self.setup_step(
+            self.stepClass(
+                repourl='./repository:name.git',
+                shared_cache=True,
+            )
+        )
+        setup_repourl_called = False
+
+        def setup_repourl() -> None:
+            nonlocal setup_repourl_called
+            setup_repourl_called = True
+
+        self.patch(step, 'setup_repourl', setup_repourl)
+
+        headers: list[str] = []
+        original_add_log = step.addLogForRemoteCommands
+
+        @defer.inlineCallbacks
+        def add_log(name: str) -> InlineCallbacksType[Any]:
+            stdio_log = yield original_add_log(name)
+            object.__setattr__(stdio_log, 'addHeader', headers.append)
+            return stdio_log
+
+        self.patch(step, 'addLogForRemoteCommands', add_log)
+
+        failure = yield self.assertFailure(
+            step.run_vc('main', None, None),
+            buildstep.BuildStepFailed,
+        )
+        self.assertIn(
+            'shared_cache does not support relative local repository paths',
+            str(failure),
+        )
+        self.assertFalse(setup_repourl_called)
+        self.assertTrue(
+            any('relative local repository paths' in header for header in headers),
+        )
+
+    def test_shared_cache_with_reference_error(self) -> None:
+        self.assertRaisesConfigError(
+            'Git: shared_cache and reference cannot both be set',
+            lambda: self.stepClass(
+                repourl='http://github.com/buildbot/buildbot.git',
+                shared_cache=True,
+                reference='some/ref',
+            ),
+        )

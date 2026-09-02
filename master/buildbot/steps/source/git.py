@@ -15,6 +15,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import ipaddress
+import urllib.parse
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
@@ -24,6 +27,7 @@ from twisted.internet import reactor
 from twisted.python import log
 
 from buildbot import config as bbconfig
+from buildbot import interfaces
 from buildbot.interfaces import WorkerSetupError
 from buildbot.process import buildstep
 from buildbot.process import remotecommand
@@ -43,6 +47,9 @@ if TYPE_CHECKING:
 
 GIT_HASH_LENGTH = 40
 COMBINE_FILTER_RESERVED_CHARS = frozenset('~!@#$^&*()[]{}\\;",<>?\'+%')
+SHARED_CACHE_DIR = '.git-cache'
+SHARED_CACHE_HASH_LENGTH = 16
+SHARED_CACHE_DEFAULT_PORTS = {'ssh': 22, 'git': 9418, 'http': 80, 'https': 443}
 
 
 def isTrueOrIsExactlyZero(v: Any) -> bool:
@@ -84,7 +91,16 @@ git_describe_flags = [
 
 class Git(Source, GitStepMixin):
     name = 'git'
-    renderables = ["repourl", "reference", "branch", "codebase", "mode", "method", "origin"]
+    renderables = [
+        "repourl",
+        "reference",
+        "branch",
+        "codebase",
+        "mode",
+        "method",
+        "origin",
+        "shared_cache",
+    ]
 
     def __init__(
         self,
@@ -110,6 +126,7 @@ class Git(Source, GitStepMixin):
         sshKnownHosts: Any = None,
         auth_credentials: tuple[IRenderable | str, IRenderable | str] | None = None,
         git_credentials: GitCredentialOptions | None = None,
+        shared_cache: IMaybeRenderableType[bool | str] = False,
         **kwargs: Any,
     ) -> None:
         if not getDescription and not isinstance(getDescription, dict):
@@ -120,6 +137,10 @@ class Git(Source, GitStepMixin):
         self.repourl = repourl  # type: ignore[assignment]
         self.port = port
         self.reference = reference
+        self.shared_cache = shared_cache
+        self._shared_cache_path: str | None = None
+        self._shared_cache_active = False
+        self._shared_cache_lock: defer.DeferredLock | None = None
         self.retryFetch = retryFetch
         self.submodules = submodules
         self.remoteSubmodules = remoteSubmodules
@@ -171,17 +192,109 @@ class Git(Source, GitStepMixin):
                     )
         if not isinstance(self.getDescription, (bool, dict)):
             bbconfig.error("Git: getDescription must be a boolean or a dict.")
+        if not (
+            isinstance(self.shared_cache, (bool, str))
+            or interfaces.IRenderable.providedBy(self.shared_cache)
+        ):
+            bbconfig.error("Git: shared_cache must be a boolean, string, or renderable.")
+        if (
+            not interfaces.IRenderable.providedBy(self.shared_cache)
+            and self.shared_cache
+            and not interfaces.IRenderable.providedBy(self.reference)
+            and self.reference
+        ):
+            bbconfig.error(
+                "Git: shared_cache and reference cannot both be set. "
+                "shared_cache manages the reference automatically."
+            )
+
+    def _validateRenderedSharedCache(self) -> None:
+        if not isinstance(self.shared_cache, (bool, str)):
+            raise buildstep.BuildStepFailed(
+                "Git: rendered shared_cache must be a boolean or string"
+            )
+        if isinstance(self.shared_cache, str) and any(
+            character in self.shared_cache for character in '\0\r\n'
+        ):
+            raise buildstep.BuildStepFailed(
+                "Git: rendered shared_cache path must not contain NUL or newline characters"
+            )
+        if (
+            isinstance(self.shared_cache, str)
+            and self.worker is not None
+            and self.worker.worker_system == 'nt'
+            and self._isPartiallyQualifiedWindowsPath(self.shared_cache)
+        ):
+            raise buildstep.BuildStepFailed(
+                "Git: Windows shared_cache paths must be fully qualified or relative"
+            )
+        if self.shared_cache and self.reference:
+            raise buildstep.BuildStepFailed("Git: shared_cache and reference cannot both be set")
+        if self.shared_cache:
+            try:
+                parsed_repourl = urllib.parse.urlsplit(self.repourl)
+            except ValueError:
+                parsed_repourl = None
+            if (
+                parsed_repourl is not None
+                and parsed_repourl.scheme.lower() in ('http', 'https')
+                and (parsed_repourl.query or parsed_repourl.fragment)
+            ):
+                raise buildstep.BuildStepFailed(
+                    "Git: shared_cache does not support HTTP(S) repository URLs "
+                    "with a query or fragment"
+                )
+        if self.shared_cache and self._isRelativeLocalRepository():
+            raise buildstep.BuildStepFailed(
+                "Git: shared_cache does not support relative local repository paths"
+            )
+
+    def _isRelativeLocalRepository(self) -> bool:
+        assert self.build is not None
+        path_module = self.build.path_module
+        if '://' in self.repourl:
+            return False
+
+        if self.worker is not None and self.worker.worker_system == 'nt':
+            windows_path = self.build.path_cls(self.repourl)
+            if self._isPartiallyQualifiedWindowsPath(self.repourl):
+                return True
+            if windows_path.is_absolute():
+                return False
+        elif path_module.isabs(self.repourl):
+            return False
+
+        drive, _ = path_module.splitdrive(self.repourl)
+        if drive:
+            return True
+
+        return ':' not in self.repourl or self.repourl.startswith(('./', '../', '.\\', '..\\'))
+
+    def _isPartiallyQualifiedWindowsPath(self, path: str) -> bool:
+        assert self.build is not None and self.build.path_cls is not None
+        windows_path = self.build.path_cls(path)
+        incomplete_unc = windows_path.drive.startswith('\\\\') and not windows_path.root
+        return bool(windows_path.drive or windows_path.root) and (
+            not windows_path.is_absolute() or incomplete_unc
+        )
 
     @defer.inlineCallbacks
     def run_vc(
         self, branch: str | None, revision: str | None, patch: Any
     ) -> InlineCallbacksType[int]:
+        self.stdio_log = yield self.addLogForRemoteCommands("stdio")
+
+        try:
+            self._validateRenderedSharedCache()
+        except buildstep.BuildStepFailed as e:
+            self._reportSharedCache(str(e))
+            raise
+
         self.setup_repourl()
         self.branch = branch or 'HEAD'
         self.revision = revision
 
         self.method = self._getMethod()
-        self.stdio_log = yield self.addLogForRemoteCommands("stdio")
 
         auth_workdir = self._get_auth_data_workdir()
 
@@ -370,6 +483,82 @@ class Git(Source, GitStepMixin):
         if self.method == 'copy' and self.mode == 'full':
             return self.srcdir
         return self.workdir
+
+    def _computeCachePath(self) -> str:
+        assert self.worker is not None
+        worker_basedir = self.worker.worker_basedir
+        if self.worker.worker_system == 'nt':
+            basedir_is_absolute = self.build.path_cls(
+                worker_basedir
+            ).is_absolute() and not self._isPartiallyQualifiedWindowsPath(worker_basedir)
+        else:
+            basedir_is_absolute = self.build.path_module.isabs(worker_basedir)
+        if not worker_basedir or not basedir_is_absolute:
+            raise ValueError("shared_cache requires an absolute worker basedir")
+
+        if isinstance(self.shared_cache, str):
+            cache_path = self.shared_cache
+            if self.worker.worker_system == 'nt':
+                if self._isPartiallyQualifiedWindowsPath(cache_path):
+                    raise ValueError(
+                        "Windows shared_cache paths must be fully qualified or relative"
+                    )
+                cache_path_is_absolute = self.build.path_cls(cache_path).is_absolute()
+            else:
+                cache_path_is_absolute = self.build.path_module.isabs(cache_path)
+            if not cache_path_is_absolute:
+                cache_path = self.build.path_module.join(worker_basedir, cache_path)
+            return self.build.path_module.normpath(cache_path)
+
+        repo_hash = hashlib.sha256(self._getSharedCacheIdentity().encode('utf-8')).hexdigest()[
+            :SHARED_CACHE_HASH_LENGTH
+        ]
+        return self.build.path_module.join(worker_basedir, SHARED_CACHE_DIR, f'{repo_hash}.git')
+
+    def _getSharedCacheIdentity(self, url: str | None = None) -> str:
+        if url is None:
+            url = self.repourl
+        try:
+            parsed = urllib.parse.urlsplit(url)
+        except ValueError:
+            return url
+        if not parsed.scheme or parsed.hostname is None:
+            return url
+        if '[' in parsed.netloc:
+            try:
+                ipaddress.IPv6Address(parsed.hostname)
+            except ValueError:
+                return url
+
+        scheme = parsed.scheme.lower()
+        try:
+            port = parsed.port
+        except ValueError:
+            netloc = parsed.netloc.rsplit('@', 1)[-1]
+        else:
+            hostname = parsed.hostname
+            if ':' in hostname:
+                hostname = f'[{hostname}]'
+            netloc = hostname
+            if port is not None and port != SHARED_CACHE_DEFAULT_PORTS.get(scheme):
+                netloc += f':{port}'
+        if scheme not in ('http', 'https') and parsed.username:
+            netloc = f'{urllib.parse.quote(parsed.username, safe="")}@{netloc}'
+        return urllib.parse.urlunsplit((
+            scheme,
+            netloc,
+            parsed.path,
+            parsed.query,
+            parsed.fragment,
+        ))
+
+    def _reportSharedCache(self, message: str) -> None:
+        if self.build is not None:
+            message = self.build.properties.cleanupTextFromSecrets(message)
+        log.msg(message)
+        stdio_log = getattr(self, 'stdio_log', None)
+        if stdio_log is not None:
+            stdio_log.addHeader(message + '\n')
 
     def _getPartialCloneRemote(self) -> str:
         return self.origin or 'origin'
