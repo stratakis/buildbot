@@ -75,7 +75,9 @@ The Git step takes the following arguments:
    The cache applies only to the top-level repository: submodule object databases and Git LFS payloads are not shared.
 
    Cache contents and refresh
+      New clones use ``--reference`` and existing repositories get a Buildbot-managed entry in ``.git/objects/info/alternates``, recorded alongside it in a ``buildbot-shared-cache`` marker file so Buildbot can tell its own entry from one you added.
       In the cache itself Buildbot records ``buildbot.sharedCacheIdentity`` and the timestamps ``buildbot.sharedCacheLastFsck`` and ``buildbot.sharedCacheFsckFailed``; removing both forces the next build to re-check the cache.
+      For an existing linked working tree, Buildbot asks Git for the common object-info directory instead of assuming that ``.git`` is a directory.
       Buildbot creates the cache with ``git init --bare`` and then populates it through its controlled fetch path instead of cloning the upstream repository into the cache.
       This avoids temporarily storing URL userinfo as the cache's ``origin`` and avoids Git clone's local hard-link optimization.
       The cache stores branch heads for the repository and fetches tags only when ``tags=True``.
@@ -94,6 +96,8 @@ The Git step takes the following arguments:
       An administrator must repair or retire a preserved cache only after migrating or recreating dependent work directories.
       A failed cache-backed clone is retried once without the cache.
       Using ``clobberOnFailure=True`` can recreate an existing checkout without the cache when its fetch fails, but it does not repair or remove an unusable shared cache.
+      Buildbot limits each worker-to-master read of its checkout marker and alternates file to 256 KiB.
+      If existing metadata exceeds that limit or is not valid UTF-8, Buildbot leaves it unchanged and skips shared-cache alternates management for that checkout.
 
    Concurrency and maintenance
       Cache preparation, update and validation are serialized per master; the cache lock is released before checkout work begins so builders can use the populated cache concurrently.
@@ -109,6 +113,16 @@ The Git step takes the following arguments:
       The :bb:step:`GitLab` step is the common case: it rewrites ``repourl`` to the source project of each merge request, so a busy project accumulates one cache per contributing fork.
       Cross-fork cache sharing is not supported.
       Remove an unused cache only after all work directories that reference it have been migrated or recreated.
+
+   Checkout alternates and migration
+      Existing repositories start using the cache but do not discard objects they already contain, so they do not shrink automatically.
+      Clobber or recreate existing work directories to realize the disk savings.
+      Buildbot does not replace an existing managed alternate when the configured cache path changes, because that alternate may contain the only copy of objects borrowed by the checkout.
+      Existing work directories continue using the old cache until they are clobbered or recreated, so the old cache must remain available during that migration.
+      Buildbot matches its managed alternate by literal path text, so configure the worker base directory and any custom cache path with one consistent spelling; an equivalent spelling through a symbolic link, a Windows 8.3 short name, or different letter case is treated as a different path and can require clobbering the checkout as if the cache path had changed.
+      Buildbot also preserves an existing managed alternate if cache preparation is temporarily unavailable.
+      If an old cache has been deleted or damaged, the checkout may require clobbering before it can continue without it.
+      Disabling the option does not remove an entry installed by an earlier build; clobber or recreate the work directory when disabling it.
 
    Cache identity and credentials
       The cache identity uses a lowercase scheme and drops a port that is the default for it, so ``git@host:repo``, ``ssh://git@host/repo`` and ``ssh://git@host:22/repo`` share one cache; other spelling differences, such as a non-default port or a trailing slash, select different caches.

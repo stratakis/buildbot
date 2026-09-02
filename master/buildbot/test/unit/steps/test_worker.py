@@ -387,6 +387,27 @@ class TestCompositeStepMixin(TestBuildStepMixin, TestReactorMixin, unittest.Test
         self.expect_outcome(result=SUCCESS)
         return self.run_step()
 
+    def test_getFileContentFromWorkerMaxsize(self) -> defer.Deferred[None]:
+        @defer.inlineCallbacks
+        def testFunc(x: Any) -> InlineCallbacksType[None]:
+            res = yield x.getFileContentFromWorker("file.txt", maxsize=123)
+            self.assertEqual(res, "Hello world!")
+
+        self.setup_step(CompositeUser(testFunc))
+        self.expect_commands(
+            ExpectUploadFile(
+                workersrc="file.txt",
+                workdir='wkdir',
+                blocksize=32 * 1024,
+                maxsize=123,
+                writer=ExpectRemoteRef(remotetransfer.StringFileWriter),
+            )
+            .upload_string("Hello world!")
+            .exit(0)
+        )
+        self.expect_outcome(result=SUCCESS)
+        return self.run_step()
+
     def test_downloadFileContentToWorker(self) -> defer.Deferred[None]:
         @defer.inlineCallbacks
         def testFunc(x: Any) -> InlineCallbacksType[None]:

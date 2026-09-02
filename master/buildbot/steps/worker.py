@@ -314,14 +314,20 @@ class CompositeStepMixin:
             **kwargs,
         )
 
-    def getFileContentFromWorker(self, filename: str, abandonOnFailure: bool = False) -> Any:
+    def getFileContentFromWorker(
+        self,
+        filename: str,
+        abandonOnFailure: bool = False,
+        *,
+        maxsize: int | None = None,
+    ) -> Any:
         self.checkWorkerHasCommand("uploadFile")  # type: ignore[attr-defined]
         fileWriter = remotetransfer.StringFileWriter()
         # default arguments
         args: dict[str, Any] = {
             'workdir': self.workdir,  # type: ignore[attr-defined]
             'writer': fileWriter,
-            'maxsize': None,
+            'maxsize': maxsize,
             'blocksize': 32 * 1024,
         }
 

@@ -51,13 +51,19 @@ GIT_HASH_LENGTH = 40
 COMBINE_FILTER_RESERVED_CHARS = frozenset('~!@#$^&*()[]{}\\;",<>?\'+%')
 SHARED_CACHE_DIR = '.git-cache'
 SHARED_CACHE_HASH_LENGTH = 16
+SHARED_CACHE_ALTERNATES_MARKER = 'buildbot-shared-cache'
 SHARED_CACHE_LAST_FSCK_CONFIG = 'buildbot.sharedCacheLastFsck'
 SHARED_CACHE_FSCK_FAILED_CONFIG = 'buildbot.sharedCacheFsckFailed'
 SHARED_CACHE_FSCK_INTERVAL = 24 * 60 * 60
+SHARED_CACHE_METADATA_MAX_SIZE = 256 * 1024
 SHARED_CACHE_DEFAULT_PORTS = {'ssh': 22, 'git': 9418, 'http': 80, 'https': 443}
 _shared_cache_locks: weakref.WeakKeyDictionary[Any, dict[str, defer.DeferredLock]] = (
     weakref.WeakKeyDictionary()
 )
+
+
+class _SharedCacheMetadataReadError(Exception):
+    pass
 
 
 def isTrueOrIsExactlyZero(v: Any) -> bool:
@@ -407,7 +413,11 @@ class Git(Source, GitStepMixin):
     @defer.inlineCallbacks
     def clobber(self) -> InlineCallbacksType[None]:
         yield self._doClobber()
-        res = yield self._fullClone(shallowClone=self.shallow)
+        res = yield self._fullCloneCacheAware(shallowClone=self.shallow)
+        if res != RC_SUCCESS and self._shared_cache_active:
+            self._disableSharedCache()
+            yield self._doClobber()
+            res = yield self._fullClone(shallowClone=self.shallow)
         if res != RC_SUCCESS:
             raise buildstep.BuildStepFailed
 
@@ -1012,6 +1022,142 @@ class Git(Source, GitStepMixin):
             self._shared_cache_lock = None
             lock.release()
 
+    @defer.inlineCallbacks
+    def _getAlternatesPaths(self) -> InlineCallbacksType[tuple[str, str] | None]:
+        assert self.build is not None
+        info_dir = yield self._dovccmd(
+            ['rev-parse', '--git-path', 'objects/info'],
+            abandonOnFailure=False,
+            collectStdout=True,
+        )
+        if not isinstance(info_dir, str):
+            return None
+        info_dir = info_dir.rstrip('\r\n')
+        if not info_dir or '\0' in info_dir or '\r' in info_dir or '\n' in info_dir:
+            log.msg("Could not determine the Git object info directory")
+            return None
+        return (
+            self.build.path_module.join(info_dir, 'alternates'),
+            self.build.path_module.join(info_dir, SHARED_CACHE_ALTERNATES_MARKER),
+        )
+
+    def _getWorkerFilePath(self, path: str) -> str:
+        assert self.build is not None
+        if self.build.path_module.isabs(path):
+            return path
+        return self.build.path_module.join(self.workdir, path)
+
+    @defer.inlineCallbacks
+    def _writeWorkerFileAtomically(self, path: str, content: str) -> InlineCallbacksType[bool]:
+        assert self.worker is not None
+        temporary_path = path + '.buildbot-tmp'
+        result = yield self.downloadFileContentToWorker(
+            temporary_path,
+            content,
+            workdir=self.workdir,
+            abandonOnFailure=False,
+        )
+        if result is None:
+            return False
+
+        if self.worker.worker_system == 'nt':
+            command = ['cmd.exe', '/c', 'move', '/Y', temporary_path, path]
+        else:
+            command = ['mv', '-f', temporary_path, path]
+        cmd = remotecommand.RemoteShellCommand(
+            self.workdir,
+            command,
+            env=self.env,
+            logEnviron=self.logEnviron,
+            timeout=self.timeout,
+        )
+        cmd.useLog(self.stdio_log, False)
+        yield self.runCommand(cmd)
+        if cmd.didFail():
+            yield self.runRmFile(
+                self._getWorkerFilePath(temporary_path),
+                abandonOnFailure=False,
+            )
+            return False
+        return True
+
+    @defer.inlineCallbacks
+    def _readWorkerFile(self, path: str) -> InlineCallbacksType[str | None]:
+        try:
+            content = yield self.getFileContentFromWorker(
+                path,
+                abandonOnFailure=False,
+                maxsize=SHARED_CACHE_METADATA_MAX_SIZE,
+            )
+        except UnicodeDecodeError:
+            raise _SharedCacheMetadataReadError(
+                f"Git shared-cache metadata file {path!r} is not valid UTF-8"
+            ) from None
+
+        if content is None:
+            if (yield self.pathExists(self._getWorkerFilePath(path))):
+                raise _SharedCacheMetadataReadError(
+                    f"Git shared-cache metadata file {path!r} could not be read safely"
+                )
+            return None
+        return content
+
+    @defer.inlineCallbacks
+    def _ensureAlternates(self) -> InlineCallbacksType[None]:
+        assert self.build is not None
+        if not self.shared_cache:
+            return
+        if not self._shared_cache_active or not self._shared_cache_path:
+            # Existing checkouts may still depend on their configured alternate.
+            return
+
+        alternates_paths = yield self._getAlternatesPaths()
+        if alternates_paths is None:
+            return
+        alternates_path, marker_path = alternates_paths
+        try:
+            marker_content = yield self._readWorkerFile(marker_path)
+            alternates_content = yield self._readWorkerFile(alternates_path)
+        except _SharedCacheMetadataReadError as e:
+            log.msg(str(e))
+            return
+
+        lines = alternates_content.splitlines() if alternates_content is not None else []
+        old_managed_path = marker_content.strip() if marker_content else None
+
+        new_managed_path = self.build.path_module.join(self._shared_cache_path, 'objects')
+        new_managed_path = new_managed_path.replace('\\', '/')
+        if old_managed_path and old_managed_path != new_managed_path:
+            log.msg(
+                "Not replacing the existing Git shared-cache alternate "
+                f"{old_managed_path!r} with {new_managed_path!r}; "
+                "clobber or recreate the checkout to migrate it"
+            )
+            return
+
+        if new_managed_path not in lines:
+            lines.append(new_managed_path)
+
+        desired_alternates = '\n'.join(lines) + '\n'
+        alternates_changed = alternates_content != desired_alternates
+        if alternates_changed and not (
+            yield self._writeWorkerFileAtomically(alternates_path, desired_alternates)
+        ):
+            return
+
+        desired_marker = new_managed_path + '\n'
+        if marker_content != desired_marker and not (
+            yield self._writeWorkerFileAtomically(marker_path, desired_marker)
+        ):
+            if alternates_changed:
+                if alternates_content is None:
+                    yield self.runRmFile(
+                        self._getWorkerFilePath(alternates_path),
+                        abandonOnFailure=False,
+                    )
+                else:
+                    yield self._writeWorkerFileAtomically(alternates_path, alternates_content)
+
     def _getPartialCloneRemote(self) -> str:
         return self.origin or 'origin'
 
@@ -1076,6 +1222,7 @@ class Git(Source, GitStepMixin):
         self, _: Any, shallowClone: bool | int, abandonOnFailure: bool = True
     ) -> InlineCallbacksType[int | None]:
         yield self._ensurePartialCloneConfig()
+        yield self._ensureAlternates()
 
         fetch_required = True
 
@@ -1166,8 +1313,9 @@ class Git(Source, GitStepMixin):
                 command += ['--branch', self.branch]  # type: ignore[list-item]
         if shallowClone:
             command += ['--depth', str(int(shallowClone))]
-        if self.reference:
-            command += ['--reference', self.reference]
+        reference = self._shared_cache_path if self._shared_cache_active else self.reference
+        if reference:
+            command += ['--reference', reference]
         if self.origin:
             command += ['--origin', self.origin]
         if self.filters:
@@ -1188,10 +1336,18 @@ class Git(Source, GitStepMixin):
         else:
             abandonOnFailure = True
         # If it's a shallow clone abort build step
-        res = yield self._dovccmd(command, abandonOnFailure=(abandonOnFailure and shallowClone))  # type: ignore[arg-type]
+        res = yield self._dovccmd(
+            command,
+            abandonOnFailure=bool(
+                abandonOnFailure and shallowClone and not self._shared_cache_active
+            ),
+        )
 
         if switchToBranch:
             res = yield self._fetch(None, shallowClone=shallowClone)
+
+        if res != RC_SUCCESS and self._shared_cache_active:
+            return res
 
         done = self.stopped or res == RC_SUCCESS  # or shallow clone??
         if self.retry and not done:
@@ -1217,6 +1373,8 @@ class Git(Source, GitStepMixin):
         if res != RC_SUCCESS:
             return res
 
+        yield self._ensureAlternates()
+
         # If revision specified checkout that revision
         if self.revision:
             res = yield self._dovccmd(['checkout', '-f', self.revision], shallowClone)  # type: ignore[arg-type]
@@ -1234,12 +1392,26 @@ class Git(Source, GitStepMixin):
         return res
 
     @defer.inlineCallbacks
+    def _fullCloneCacheAware(self, shallowClone: bool | int) -> InlineCallbacksType[int | None]:
+        try:
+            res = yield self._fullClone(shallowClone)
+        except buildstep.BuildStepFailed:
+            if not self._shared_cache_active:
+                raise
+            res = 1
+        return res
+
+    @defer.inlineCallbacks
     def _fullCloneOrFallback(self, shallowClone: bool | int) -> InlineCallbacksType[int | None]:
         """Wrapper for _fullClone(). In the case of failure, if clobberOnFailure
         is set to True remove the build directory and try a full clone again.
         """
 
-        res = yield self._fullClone(shallowClone)
+        res = yield self._fullCloneCacheAware(shallowClone)
+        if res != RC_SUCCESS and self._shared_cache_active:
+            self._disableSharedCache()
+            yield self._doClobber()
+            res = yield self._fullClone(shallowClone)
         if res != RC_SUCCESS:
             if not self.clobberOnFailure:
                 raise buildstep.BuildStepFailed()
