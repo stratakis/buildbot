@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import urllib.parse
+import weakref
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
@@ -34,6 +35,7 @@ from buildbot.process import remotecommand
 from buildbot.steps.source.base import Source
 from buildbot.steps.worker import CompositeStepMixin
 from buildbot.util.git import RC_SUCCESS
+from buildbot.util.git import SHARED_CACHE_MINIMUM_GIT_VERSION
 from buildbot.util.git import GitStepMixin
 from buildbot.util.git_credential import GitCredentialOptions
 from buildbot.util.git_credential import add_user_password_to_credentials
@@ -49,7 +51,13 @@ GIT_HASH_LENGTH = 40
 COMBINE_FILTER_RESERVED_CHARS = frozenset('~!@#$^&*()[]{}\\;",<>?\'+%')
 SHARED_CACHE_DIR = '.git-cache'
 SHARED_CACHE_HASH_LENGTH = 16
+SHARED_CACHE_LAST_FSCK_CONFIG = 'buildbot.sharedCacheLastFsck'
+SHARED_CACHE_FSCK_FAILED_CONFIG = 'buildbot.sharedCacheFsckFailed'
+SHARED_CACHE_FSCK_INTERVAL = 24 * 60 * 60
 SHARED_CACHE_DEFAULT_PORTS = {'ssh': 22, 'git': 9418, 'http': 80, 'https': 443}
+_shared_cache_locks: weakref.WeakKeyDictionary[Any, dict[str, defer.DeferredLock]] = (
+    weakref.WeakKeyDictionary()
+)
 
 
 def isTrueOrIsExactlyZero(v: Any) -> bool:
@@ -311,6 +319,8 @@ class Git(Source, GitStepMixin):
 
             yield self._git_auth.download_auth_files_if_needed(auth_workdir)
 
+            yield self._ensureSharedCache()
+
             yield self._getAttrGroupMember('mode', self.mode)()
             if patch:
                 yield self.patch(patch)
@@ -318,6 +328,7 @@ class Git(Source, GitStepMixin):
             res = yield self.parseCommitDescription()
             return res
         finally:
+            self._releaseSharedCacheLock()
             yield self._git_auth.remove_auth_files_if_needed(auth_workdir)
 
     @defer.inlineCallbacks
@@ -552,6 +563,436 @@ class Git(Source, GitStepMixin):
             parsed.fragment,
         ))
 
+    def _getSharedCacheLock(self, cache_path: str) -> defer.DeferredLock:
+        assert self.worker is not None
+        worker_locks = _shared_cache_locks.setdefault(self.worker, {})
+        lock_path = self.build.path_module.normcase(cache_path)
+        return worker_locks.setdefault(lock_path, defer.DeferredLock())
+
+    def _acquireSharedCacheLock(
+        self, lock: defer.DeferredLock
+    ) -> defer.Deferred[defer.DeferredLock]:
+        assert self.master is not None
+        d = lock.acquire()
+        if self.timeout is not None:
+            d.addTimeout(self.timeout, self.master.reactor)
+        return d
+
+    def _getSharedCacheGitConfig(self, cache_path: str) -> dict[str, str]:
+        assert self.build is not None
+        config = {
+            'core.hooksPath': self.build.path_module.join(cache_path, 'buildbot-hooks'),
+            'fetch.writeCommitGraph': 'false',
+            'gc.auto': '0',
+            'maintenance.auto': 'false',
+            'protocol.ext.allow': 'never',
+        }
+        return config
+
+    def _dovccache(
+        self,
+        cache_path: str,
+        command: list[str],
+        *,
+        abandonOnFailure: bool = True,
+        collectStdout: bool = False,
+        initialStdin: str | None = None,
+        use_cache_repository: bool = True,
+    ) -> defer.Deferred[Any]:
+        assert self.worker is not None
+        cache_command = command
+        workdir = cache_path
+        auth_kwargs: dict[str, str] = {}
+        if not use_cache_repository:
+            workdir = self.worker.worker_basedir
+
+        return self._dovccmd(
+            cache_command,
+            abandonOnFailure=abandonOnFailure,
+            collectStdout=collectStdout,
+            initialStdin=initialStdin,
+            workdir=workdir,
+            config_overrides=self._getSharedCacheGitConfig(cache_path),
+            sanitize_repository_environment=True,
+            use_step_config=False,
+            **auth_kwargs,
+        )
+
+    @defer.inlineCallbacks
+    def _isBareRepository(self, cache_path: str) -> InlineCallbacksType[bool]:
+        stdout = yield self._dovccache(
+            cache_path,
+            [f'--git-dir={cache_path}', 'rev-parse', '--is-bare-repository'],
+            abandonOnFailure=False,
+            collectStdout=True,
+        )
+        return isinstance(stdout, str) and stdout.strip() == 'true'
+
+    @defer.inlineCallbacks
+    def _isPartialCloneRepository(self, cache_path: str) -> InlineCallbacksType[bool]:
+        partial_config = yield self._dovccache(
+            cache_path,
+            [
+                'config',
+                '--local',
+                '--get-regexp',
+                r'^(extensions\.partialclone|remote\..*\.(promisor|partialclonefilter))$',
+            ],
+            abandonOnFailure=False,
+            collectStdout=True,
+        )
+        for line in partial_config.splitlines():
+            key, separator, value = line.partition(' ')
+            key = key.lower()
+            if key.endswith('.partialclonefilter') or key == 'extensions.partialclone':
+                return True
+            if key.endswith('.promisor'):
+                if not separator:
+                    return True
+                if value.strip().lower() not in ('0', 'off', 'false', 'no', ''):
+                    return True
+        return False
+
+    @defer.inlineCallbacks
+    def _findSharedCacheAlternate(self, cache_path: str) -> InlineCallbacksType[str | None]:
+        assert self.build is not None
+        info_path = self.build.path_module.join(cache_path, 'objects', 'info')
+        for filename in ('alternates', 'http-alternates'):
+            alternate_path = self.build.path_module.join(info_path, filename)
+            if (yield self.pathExists(alternate_path)):
+                return alternate_path
+        return None
+
+    @defer.inlineCallbacks
+    def _getSharedCacheRecordedIdentity(self, cache_path: str) -> InlineCallbacksType[str]:
+        identity = yield self._dovccache(
+            cache_path,
+            ['config', '--local', '--get', 'buildbot.sharedCacheIdentity'],
+            abandonOnFailure=False,
+            collectStdout=True,
+        )
+        if not isinstance(identity, str):
+            return ''
+        return identity.rstrip('\r\n')
+
+    @defer.inlineCallbacks
+    def _initializeSharedCache(self, cache_path: str) -> InlineCallbacksType[bool]:
+        assert self.worker is not None
+        parent_path = self.build.path_module.dirname(cache_path)
+        rc = yield self.runMkdir(parent_path, abandonOnFailure=False)
+        if rc != RC_SUCCESS:
+            return False
+
+        rc = yield self._dovccache(
+            cache_path,
+            ['init', '--bare', cache_path],
+            use_cache_repository=False,
+            abandonOnFailure=False,
+        )
+        if rc != RC_SUCCESS:
+            yield self._removeSharedCache(cache_path)
+        return rc == RC_SUCCESS
+
+    @defer.inlineCallbacks
+    def _removeSharedCache(self, cache_path: str) -> InlineCallbacksType[bool]:
+        rc = yield self.runRmdir(cache_path, abandonOnFailure=False, timeout=self.timeout)
+        return rc == RC_SUCCESS
+
+    @defer.inlineCallbacks
+    def _prepareSharedCacheRepository(
+        self, cache_path: str, managed_cache: bool
+    ) -> InlineCallbacksType[bool]:
+        assert self.build is not None
+        cache_exists = yield self.pathExists(cache_path)
+        created_cache = False
+        if cache_exists and not (yield self._isBareRepository(cache_path)):
+            self._reportSharedCache(f"Git shared cache at {cache_path!r} is not a bare repository")
+            return False
+
+        if not cache_exists:
+            if not (yield self._initializeSharedCache(cache_path)):
+                return False
+            created_cache = True
+
+        alternate_path = yield self._findSharedCacheAlternate(cache_path)
+        if alternate_path is not None:
+            self._reportSharedCache(
+                f"Git shared cache at {cache_path!r} uses alternate object database "
+                f"file {alternate_path!r}"
+            )
+            if created_cache:
+                yield self._removeSharedCache(cache_path)
+            return False
+
+        identity = self._getSharedCacheIdentity()
+        if cache_exists and managed_cache and not created_cache:
+            recorded = yield self._getSharedCacheRecordedIdentity(cache_path)
+            if recorded and recorded != identity:
+                self._reportSharedCache(
+                    f"Git shared cache at {cache_path!r} records a different repository"
+                )
+                return False
+
+        if (yield self._isPartialCloneRepository(cache_path)):
+            self._reportSharedCache(f"Git shared cache at {cache_path!r} is a partial clone")
+            if created_cache:
+                yield self._removeSharedCache(cache_path)
+            return False
+
+        remote_url = yield self._dovccache(
+            cache_path,
+            ['config', '--local', '--get', 'remote.origin.url'],
+            abandonOnFailure=False,
+            collectStdout=True,
+        )
+        remote_url = remote_url.rstrip('\r\n') if isinstance(remote_url, str) else ''
+        if remote_url:
+            if not managed_cache and self._getSharedCacheIdentity(remote_url) != identity:
+                self._reportSharedCache(
+                    f"Git shared cache at {cache_path!r} belongs to a different repository"
+                )
+                if created_cache:
+                    yield self._removeSharedCache(cache_path)
+                return False
+            rc = yield self._dovccache(
+                cache_path,
+                ['remote', 'set-url', 'origin', identity],
+                abandonOnFailure=False,
+            )
+        else:
+            rc = yield self._dovccache(
+                cache_path,
+                ['remote', 'add', 'origin', identity],
+                abandonOnFailure=False,
+            )
+            if rc != RC_SUCCESS:
+                rc = yield self._dovccache(
+                    cache_path,
+                    ['remote', 'set-url', 'origin', identity],
+                    abandonOnFailure=False,
+                )
+        if rc != RC_SUCCESS:
+            if created_cache:
+                yield self._removeSharedCache(cache_path)
+            return False
+
+        hooks_path = self.build.path_module.join(cache_path, 'buildbot-hooks')
+        rc = yield self.runRmdir(hooks_path, abandonOnFailure=False, timeout=self.timeout)
+        if rc != RC_SUCCESS:
+            self._reportSharedCache(
+                f"Failed to clear Git shared cache hooks directory at {hooks_path!r}"
+            )
+            if created_cache:
+                yield self._removeSharedCache(cache_path)
+            return False
+        rc = yield self.runMkdir(hooks_path, abandonOnFailure=False)
+        if rc != RC_SUCCESS:
+            if created_cache:
+                yield self._removeSharedCache(cache_path)
+            return False
+
+        for name, value in [
+            ('gc.auto', '0'),
+            ('maintenance.auto', 'false'),
+            ('fetch.writeCommitGraph', 'false'),
+            ('core.hooksPath', hooks_path),
+        ]:
+            rc = yield self._dovccache(
+                cache_path,
+                ['config', '--local', name, value],
+                abandonOnFailure=False,
+            )
+            if rc != RC_SUCCESS:
+                if created_cache:
+                    yield self._removeSharedCache(cache_path)
+                return False
+        return True
+
+    @defer.inlineCallbacks
+    def _isSharedCacheHealthy(self, cache_path: str) -> InlineCallbacksType[bool]:
+        assert self.master is not None
+        identity = yield self._getSharedCacheRecordedIdentity(cache_path)
+        if identity != self._getSharedCacheIdentity():
+            return False
+
+        now = int(self.master.reactor.seconds())
+        last_fsck = yield self._getSharedCacheTimestamp(cache_path, SHARED_CACHE_LAST_FSCK_CONFIG)
+        if last_fsck is not None and 0 <= now - last_fsck < SHARED_CACHE_FSCK_INTERVAL:
+            return True
+
+        last_failure = yield self._getSharedCacheTimestamp(
+            cache_path, SHARED_CACHE_FSCK_FAILED_CONFIG
+        )
+        if last_failure is not None and 0 <= now - last_failure < SHARED_CACHE_FSCK_INTERVAL:
+            self._reportSharedCache(
+                f"Git shared cache at {cache_path!r} failed its last integrity check; "
+                "not re-checking it yet"
+            )
+            return False
+
+        rc = yield self._dovccache(cache_path, ['fsck', '--no-dangling'], abandonOnFailure=False)
+        if rc != RC_SUCCESS:
+            yield self._recordSharedCacheFsckTime(cache_path, SHARED_CACHE_FSCK_FAILED_CONFIG)
+            return False
+
+        yield self._recordSharedCacheFsckTime(cache_path, SHARED_CACHE_LAST_FSCK_CONFIG)
+        yield self._dovccache(
+            cache_path,
+            ['config', '--local', '--unset', SHARED_CACHE_FSCK_FAILED_CONFIG],
+            abandonOnFailure=False,
+        )
+        return True
+
+    @defer.inlineCallbacks
+    def _getSharedCacheTimestamp(
+        self, cache_path: str, key: str
+    ) -> InlineCallbacksType[int | None]:
+        output = yield self._dovccache(
+            cache_path,
+            ['config', '--local', '--get', key],
+            abandonOnFailure=False,
+            collectStdout=True,
+        )
+        if not isinstance(output, str):
+            return None
+        try:
+            return int(output.strip())
+        except ValueError:
+            return None
+
+    @defer.inlineCallbacks
+    def _recordSharedCacheFsckTime(self, cache_path: str, key: str) -> InlineCallbacksType[None]:
+        assert self.master is not None
+        rc = yield self._dovccache(
+            cache_path,
+            ['config', '--local', key, str(int(self.master.reactor.seconds()))],
+            abandonOnFailure=False,
+        )
+        if rc != RC_SUCCESS:
+            log.msg(f"Failed to record the Git shared cache check time at {cache_path!r}")
+
+    @defer.inlineCallbacks
+    def _markSharedCachePopulated(self, cache_path: str) -> InlineCallbacksType[bool]:
+        rc = yield self._dovccache(
+            cache_path,
+            ['config', '--local', 'buildbot.sharedCacheIdentity', self._getSharedCacheIdentity()],
+            abandonOnFailure=False,
+        )
+        return rc == RC_SUCCESS
+
+    @defer.inlineCallbacks
+    def _updateSharedCache(self, cache_path: str) -> InlineCallbacksType[bool]:
+        if getattr(self, 'revision', None) and not self.tags:
+            rc = yield self._dovccache(
+                cache_path,
+                ['cat-file', '-e', f'{self.revision}^0'],
+                abandonOnFailure=False,
+            )
+            if rc == RC_SUCCESS:
+                return (yield self._markSharedCachePopulated(cache_path))
+
+        fetch_cmd = [
+            'fetch',
+            '--prune',
+            '--no-tags',
+        ]
+        if self.prog and self.supportsProgress:
+            fetch_cmd.append('--progress')
+        fetch_cmd += [
+            # not origin, which is deliberately credential-free
+            self.repourl,
+            '+refs/heads/*:refs/heads/*',
+            # With no destination, Git records this ref only in FETCH_HEAD.
+            self.branch,  # type: ignore[list-item]
+        ]
+        if self.tags:
+            fetch_cmd.append('+refs/tags/*:refs/tags/*')
+
+        rc = yield self._dovccache(
+            cache_path,
+            fetch_cmd,
+            abandonOnFailure=False,
+        )
+        if rc != RC_SUCCESS:
+            self._reportSharedCache(f"Failed to update Git shared cache at {cache_path!r}")
+            return False
+        return (yield self._markSharedCachePopulated(cache_path))
+
+    def _isCacheInDeletedBasedir(self, cache_path: str) -> bool:
+        assert self.build is not None
+        if not getattr(self.worker, 'worker_deletes_leftover_dirs', False):
+            return False
+        basedir = getattr(self.worker, 'worker_basedir', None)
+        if not basedir:
+            return False
+        path_module = self.build.path_module
+        normalized_base = path_module.normcase(path_module.normpath(basedir))
+        normalized_cache = path_module.normcase(path_module.normpath(cache_path))
+        normalized_base = normalized_base.rstrip(path_module.sep) + path_module.sep
+        return normalized_cache.startswith(normalized_base)
+
+    @defer.inlineCallbacks
+    def _ensureSharedCache(self) -> InlineCallbacksType[None]:
+        self._shared_cache_path = None
+        self._shared_cache_active = False
+        if not self.shared_cache:
+            return
+        if not self.supportsSharedCache:
+            self._reportSharedCache(
+                f"shared_cache requires Git {SHARED_CACHE_MINIMUM_GIT_VERSION} or later"
+            )
+            return
+
+        try:
+            cache_path = self._computeCachePath()
+        except ValueError as e:
+            self._reportSharedCache(str(e))
+            return
+
+        if self._isCacheInDeletedBasedir(cache_path):
+            self._reportSharedCache(
+                f"The worker deletes leftover directories, which would remove the Git shared "
+                f"cache at {cache_path!r} on every reconnect; configure shared_cache with an "
+                "absolute path outside the worker base directory to use it"
+            )
+            return
+
+        managed_cache = not isinstance(self.shared_cache, str)
+        lock = self._getSharedCacheLock(cache_path)
+        try:
+            yield self._acquireSharedCacheLock(lock)
+        except defer.TimeoutError:
+            self._reportSharedCache(
+                f"Timed out waiting for the Git shared cache lock for {cache_path!r}; "
+                "continuing without the cache"
+            )
+            return
+        self._shared_cache_lock = lock
+        try:
+            cache_ready = yield self._prepareSharedCacheRepository(cache_path, managed_cache)
+            if not cache_ready:
+                self._reportSharedCache(
+                    f"Continuing without the Git shared cache at {cache_path!r}"
+                )
+                self._disableSharedCache()
+                return
+            cache_updated = yield self._updateSharedCache(cache_path)
+            if not cache_updated:
+                self._reportSharedCache(
+                    f"Retaining Git shared cache at {cache_path!r} after an update failure"
+                )
+                self._disableSharedCache()
+                return
+            if not (yield self._isSharedCacheHealthy(cache_path)):
+                self._reportSharedCache(f"Preserving unusable Git shared cache at {cache_path!r}")
+                self._disableSharedCache()
+                return
+            self._shared_cache_path = cache_path
+            self._shared_cache_active = True
+            log.msg(f"Using Git shared cache at {cache_path!r}")
+        finally:
+            self._releaseSharedCacheLock()
+
     def _reportSharedCache(self, message: str) -> None:
         if self.build is not None:
             message = self.build.properties.cleanupTextFromSecrets(message)
@@ -559,6 +1000,17 @@ class Git(Source, GitStepMixin):
         stdio_log = getattr(self, 'stdio_log', None)
         if stdio_log is not None:
             stdio_log.addHeader(message + '\n')
+
+    def _disableSharedCache(self) -> None:
+        self._shared_cache_path = None
+        self._shared_cache_active = False
+        self._releaseSharedCacheLock()
+
+    def _releaseSharedCacheLock(self) -> None:
+        lock = self._shared_cache_lock
+        if lock is not None:
+            self._shared_cache_lock = None
+            lock.release()
 
     def _getPartialCloneRemote(self) -> str:
         return self.origin or 'origin'
